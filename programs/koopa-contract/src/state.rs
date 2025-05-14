@@ -4,12 +4,8 @@ use anchor_lang::prelude::*;
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct AjoParticipant {
     pub pubkey: Pubkey,
-    pub turn_number: u8,
-    pub claim_time: i64,
-    pub claimed: bool,
     pub claim_round: u8,
-    pub rounds_contributed:Vec<u8>,
-    pub claim_amount: u64,
+    pub contribution_round: u8,
     pub bump: u8,
 }
 
@@ -17,21 +13,20 @@ pub struct AjoParticipant {
 pub struct AjoGroup {
     // Basic group information
     pub name: String,                  // Unique name for the group
+    pub security_deposit: u64           // Amount in USDC to join this group
     pub contribution_amount: u64,      // Amount in USDC to contribute each round
-    pub interval_in_days: u16,         // Time between rounds (in days)
+    pub contribution_interval: u16     // Time between rounds when a user should pay (in days)
+    pub payout_interval: u16,         // Time between payouts (in days)
     pub num_participants: u8,          // Total number of participants needed
-    pub creator: Pubkey,               // Address of the group creator
     
     // Participants and round management
     pub participants: Vec<AjoParticipant>,     // List of all participants (ordered by join time)
-    pub current_round: u8,             // Current round number (0-indexed)
-    pub current_receiver_index: u8,    // Index of the participant receiving funds this round
-    pub started: bool,                 // Whether the group has started
-    pub completed: bool,               // Whether all rounds are completed
+    pub start_timestamp: Option<i64>, 
+    pub payout_round: u8, // state for payouts made, useful in calc current round, index of recipient
     
-    // Tracking
-    pub total_distributed: u64,        // Total amount distributed so far
-    pub last_round_timestamp: i64,     // Timestamp of when the last round started
+    pub close_votes: Vec<Pubkey>, // Track who has voted to close
+    pub is_closed: bool,
+    
     pub bumps: u8,                     // PDA bump
 }
 
