@@ -22,21 +22,21 @@ pub enum KooPaaError {
 
     #[msg("Group has already started")]
     GroupAlreadyStarted,
-
-    #[msg("Group is already closed")]
-    GroupAlreadyClosed,
-
+    
+    #[msg("Group is already full")]
+    GroupAlreadyFull,
+    
     #[msg("You have already joined this group")]
     AlreadyJoined,
-
-    #[msg("Security Deposit must be greater than 0")]
-    InvalidSecurityDeposit,
+    
+    #[msg("Only the creator can start the group")]
+    OnlyCreatorCanStart,
 
     #[msg("Only admin can update global state")]
     OnlyAdminCanUpdate,
-
-    #[msg("You have already voted to close this group")]
-    AlreadyVotedToClose,
+    
+    #[msg("Not enough participants have joined to start the group")]
+    NotEnoughParticipants,
 
     #[msg("You are not a participant in this group")]
     NotParticipant,

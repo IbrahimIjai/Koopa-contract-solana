@@ -11,22 +11,23 @@ pub struct AjoParticipant {
 #[account]
 pub struct AjoGroup {
     // Basic group information
-    pub name: String,               // Unique name for the group
-    pub security_deposit: u64,      // Amount in USDC to join this group
-    pub contribution_amount: u64,   // Amount in USDC to contribute each round
-    pub contribution_interval: u16, // Time between rounds when a user should pay (in days)
-    pub payout_interval: u16,       // Time between payouts (in days)
-    pub num_participants: u8,       // Total number of participants needed
-
+    pub name: String,                  // Unique name for the group
+    pub contribution_amount: u64,      // Amount in USDC to contribute each round
+    pub interval_in_days: u16,         // Time between rounds (in days)
+    pub num_participants: u8,          // Total number of participants needed
+    pub creator: Pubkey,               // Address of the group creator
+    
     // Participants and round management
-    pub participants: Vec<AjoParticipant>, // List of all participants (ordered by join time)
-    pub start_timestamp: Option<i64>,
-    pub payout_round: u8, // state for payouts made, useful in calc current round, index of recipient
-
-    pub close_votes: Vec<Pubkey>, // Track who has voted to close
-    pub is_closed: bool,
-
-    pub bumps: u8, // PDA bump
+    pub participants: Vec<AjoParticipant>,     // List of all participants (ordered by join time)
+    pub current_round: u8,             // Current round number (0-indexed)
+    pub current_receiver_index: u8,    // Index of the participant receiving funds this round
+    pub started: bool,                 // Whether the group has started
+    pub completed: bool,               // Whether all rounds are completed
+    
+    // Tracking
+    pub total_distributed: u64,        // Total amount distributed so far
+    pub last_round_timestamp: i64,     // Timestamp of when the last round started
+    pub bumps: u8,                     // PDA bump
 }
 
 impl AjoGroup {
