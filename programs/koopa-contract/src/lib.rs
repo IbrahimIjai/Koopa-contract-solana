@@ -3,10 +3,12 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{transfer, Mint, Token, TokenAccount, Transfer};
 
 pub mod errors;
+pub mod events;
 pub mod state;
 pub mod utils;
 
 use errors::*;
+use events::*;
 use state::*;
 use utils::*;
 
@@ -30,26 +32,34 @@ mod koopa {
         global_state.completed_groups = 0;
         global_state.admin = ctx.accounts.admin.key();
         global_state.fee_percentage = fee_percentage;
+
+        // Set fixed security deposit amounts in USDC with 6 decimals
+        global_state.creator_security_deposit = 5_000_000; // 5 USDC
+        global_state.joiner_security_deposit = 2_000_000; // 2 USDC
+
         global_state.bumps = ctx.bumps.global_state;
 
         Ok(())
     }
 
-    // Create a new Ajo group
     pub fn create_ajo_group(
         ctx: Context<CreateAjoGroup>,
         name: String,
         contribution_amount: u64,
-        interval_in_days: u16,
+        contribution_interval: u16,
+        payout_interval: u16,
         num_participants: u8,
     ) -> Result<()> {
-        // Validate inputs
         require!(
             contribution_amount > 0,
             KooPaaError::InvalidContributionAmount
         );
         require!(
-            interval_in_days > 0 && interval_in_days <= 90,
+            contribution_interval > 0 && contribution_interval <= 90,
+            KooPaaError::InvalidInterval
+        );
+        require!(
+            payout_interval >= 7 && payout_interval <= 90,
             KooPaaError::InvalidInterval
         );
         require!(
@@ -58,47 +68,97 @@ mod koopa {
         );
         require!(name.len() <= 50, KooPaaError::NameTooLong);
 
+        // Use the fixed security deposit from global state
+        let security_deposit = ctx.accounts.global_state.creator_security_deposit;
+
+        // Transfer security deposit from creator to the vault
+        let transfer_accounts = Transfer {
+            from: ctx.accounts.creator_token_account.to_account_info(),
+            to: ctx.accounts.group_token_vault.to_account_info(),
+            authority: ctx.accounts.creator.to_account_info(),
+        };
+
+        transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                transfer_accounts,
+            ),
+            security_deposit,
+        )?;
+
         let group = &mut ctx.accounts.ajo_group;
         let creator = &ctx.accounts.creator;
         let global_state = &mut ctx.accounts.global_state;
+        let clock = Clock::get()?;
 
-        // Set group data
-        group.name = name;
+        group.name = name.clone();
         group.contribution_amount = contribution_amount;
-        group.interval_in_days = interval_in_days;
-        group.num_participants = num_participants;
-        group.creator = creator.key();
-        group.participants = vec![];
-        group.current_round = 0;
-        group.started = false;
-        group.completed = false;
-        group.current_receiver_index = 0;
-        group.total_distributed = 0;
-        group.last_round_timestamp = 0;
+        group.contribution_interval = contribution_interval;
+        group.security_deposit = security_deposit;
+        group.payout_interval = payout_interval;
+        group.num_participants = num_participants - 1;
+
+        group.participants = vec![AjoParticipant {
+            pubkey: creator.key(),
+            claim_round: 0,
+            contribution_round: 0,
+            bump: ctx.bumps.group_token_vault,
+        }];
+        group.payout_round = 0;
+        group.start_timestamp = None;
+        group.close_votes = vec![];
+        group.is_closed = false;
         group.bumps = ctx.bumps.ajo_group;
 
-        // Update global state
         global_state.total_groups += 1;
-        global_state.active_groups += 1;
+
+        emit!(AjoGroupCreatedEvent {
+            group_name: name.clone(),
+            security_deposit,
+            contribution_amount,
+            num_participants,
+            contribution_interval,
+            payout_interval,
+        });
+
+        emit!(ParticipantJoinedEvent {
+            group_name: name,
+            participant: creator.key(),
+            join_timestamp: clock.unix_timestamp,
+        });
 
         Ok(())
     }
 
-    // Join an existing group
     pub fn join_ajo_group(ctx: Context<JoinAjoGroup>) -> Result<()> {
         let group = &mut ctx.accounts.ajo_group;
+        let global_state = &mut ctx.accounts.global_state;
         let participant = &ctx.accounts.participant;
+        let clock = Clock::get()?;
 
-        // Check if the group has already started
-        require!(!group.started, KooPaaError::GroupAlreadyStarted);
+        // Use the joiner security deposit from global state
+        let security_deposit = global_state.joiner_security_deposit;
 
-        // Check if the group is already full
+        // Transfer security deposit from participant to the vault
+        let transfer_accounts = Transfer {
+            from: ctx.accounts.participant_token_account.to_account_info(),
+            to: ctx.accounts.group_token_vault.to_account_info(),
+            authority: participant.to_account_info(),
+        };
+
+        transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                transfer_accounts,
+            ),
+            security_deposit,
+        )?;
+
         require!(
-            group.participants.len() < group.num_participants as usize,
-            KooPaaError::GroupAlreadyFull
+            group.start_timestamp.is_none(),
+            KooPaaError::GroupAlreadyStarted
         );
 
-        // Check if the participant is already in the group
         let already_joined = group
             .participants
             .iter()
@@ -106,103 +166,65 @@ mod koopa {
 
         require!(!already_joined, KooPaaError::AlreadyJoined);
 
-        // Store the current length before pushing to avoid borrowing issues
-        let current_position = group.participants.len() as u8;
-
-        // Add participant to the group with their data
         group.participants.push(AjoParticipant {
             pubkey: participant.key(),
-            turn_number: current_position,
-            claim_round: current_position, // Claim order based on join position
-            claimed: false,
-            claim_time: 0,
-            claim_amount: 0,
-            rounds_contributed: vec![],
-            bump: 0,
+            claim_round: 0,
+            contribution_round: 0,
+            bump: ctx.bumps.group_token_vault,
+        });
+
+        if group.participants.len() == group.num_participants as usize {
+            group.start_timestamp = Some(clock.unix_timestamp);
+            global_state.active_groups += 1;
+        }
+
+        emit!(ParticipantJoinedEvent {
+            group_name: group.name.clone(),
+            participant: participant.key(),
+            join_timestamp: clock.unix_timestamp,
         });
 
         Ok(())
     }
 
-    // Start the Ajo group (can only be called by creator when required participants have joined)
-    pub fn start_ajo_group(ctx: Context<StartAjoGroup>) -> Result<()> {
-        let group = &mut ctx.accounts.ajo_group;
-        let clock = Clock::get()?;
-
-        // Check if it's the creator calling
-        require!(
-            group.creator == ctx.accounts.creator.key(),
-            KooPaaError::OnlyCreatorCanStart
-        );
-
-        // Check if the group has required number of participants
-        require!(
-            group.participants.len() == group.num_participants as usize,
-            KooPaaError::NotEnoughParticipants
-        );
-
-        // Check if the group has already started
-        require!(!group.started, KooPaaError::GroupAlreadyStarted);
-
-        // Mark group as started and set first round timestamp
-        group.started = true;
-        group.last_round_timestamp = clock.unix_timestamp;
-        group.current_round = 0;
-
-        // The first recipient is the person with claim_round == 0
-        group.current_receiver_index = 0;
-
-        Ok(())
-    }
-
-    // Make a contribution to the Ajo group
     pub fn contribute(ctx: Context<Contribute>) -> Result<()> {
         let group = &mut ctx.accounts.ajo_group;
         let contributor = &ctx.accounts.contributor;
-        let global_state = &mut ctx.accounts.global_state;
         let clock = Clock::get()?;
 
-        // Check if the group has started
-        require!(group.started, KooPaaError::GroupNotStarted);
+        require!(
+            group.start_timestamp.is_some(),
+            KooPaaError::GroupNotStarted
+        );
 
-        // Check if the group has completed
-        require!(!group.completed, KooPaaError::GroupCompleted);
+        // Get all values we need before the mutable borrow
+        let start_timestamp = group.start_timestamp.unwrap();
+        let contribution_interval = group.contribution_interval;
+        let contribution_amount = group.contribution_amount;
 
-        // Find the participant in the group
-        let participant_index = group
+        // Now find the participant and create a mutable reference
+        let participant = group
             .participants
-            .iter()
-            .position(|p| p.pubkey == contributor.key())
+            .iter_mut()
+            .find(|p| p.pubkey == contributor.key())
             .ok_or(KooPaaError::NotParticipant)?;
 
-        // Find the current recipient (the one whose claim_round matches current_round)
-        let recipient_index = group
-            .participants
-            .iter()
-            .position(|p| p.claim_round == group.current_round)
-            .ok_or(KooPaaError::NotCurrentRecipient)?;
+        let time_since_start = clock.unix_timestamp - start_timestamp;
+        let current_round = (time_since_start / contribution_interval as i64) as u8;
 
-        let recipient_pubkey = group.participants[recipient_index].pubkey;
+        let last_paid_round = participant.contribution_round;
+        require!(
+            last_paid_round < current_round,
+            KooPaaError::AlreadyContributed
+        );
 
-        // If contributor is the current recipient, they don't need to contribute
-        if contributor.key() == recipient_pubkey {
-            return Ok(());
-        }
+        let rounds_missed = current_round - last_paid_round;
+        let transfer_amount = contribution_amount * rounds_missed as u64;
 
-        // Check if already contributed to this round
-        let already_contributed = group.participants[participant_index]
-            .rounds_contributed
-            .contains(&group.current_round);
-        require!(!already_contributed, KooPaaError::AlreadyContributed);
-
-        // Calculate fee (if any)
-        let fee_amount = calculate_fee(group.contribution_amount, global_state.fee_percentage);
-        let transfer_amount = group.contribution_amount - fee_amount;
-
-        // Transfer tokens from contributor to the current recipient
+        // Transfer tokens from contributor to the group vault
         let transfer_accounts = Transfer {
             from: ctx.accounts.contributor_token_account.to_account_info(),
-            to: ctx.accounts.recipient_token_account.to_account_info(),
+            to: ctx.accounts.group_token_vault.to_account_info(),
             authority: contributor.to_account_info(),
         };
 
@@ -214,45 +236,31 @@ mod koopa {
             transfer_amount,
         )?;
 
-        // If fee is configured, transfer fee to treasury
-        if fee_amount > 0 {
-            let fee_transfer = Transfer {
-                from: ctx.accounts.contributor_token_account.to_account_info(),
-                to: ctx.accounts.treasury_token_account.to_account_info(),
-                authority: contributor.to_account_info(),
-            };
+        participant.contribution_round = current_round;
 
-            transfer(
-                CpiContext::new(ctx.accounts.token_program.to_account_info(), fee_transfer),
-                fee_amount,
-            )?;
-
-            // Update the global state with the fee
-            global_state.total_revenue += fee_amount;
-        }
-
-        // Store the current round to avoid borrowing conflict
-        let current_round = group.current_round;
-
-        // Update participant's contribution record
-        group.participants[participant_index]
-            .rounds_contributed
-            .push(current_round);
+        emit!(ContributionMadeEvent {
+            group_name: group.name.clone(),
+            contributor: contributor.key(),
+            contribution_amount: transfer_amount,
+            current_round,
+        });
 
         Ok(())
     }
 
-    // Claim payouts for the current round
     pub fn claim_round(ctx: Context<ClaimRound>) -> Result<()> {
         let group = &mut ctx.accounts.ajo_group;
         let recipient = &ctx.accounts.recipient;
         let clock = Clock::get()?;
 
         // Check if the group has started
-        require!(group.started, KooPaaError::GroupNotStarted);
+        require!(
+            group.start_timestamp.is_some(),
+            KooPaaError::GroupNotStarted
+        );
 
-        // Check if the group has completed
-        require!(!group.completed, KooPaaError::GroupCompleted);
+        // Check if the group is closed
+        require!(!group.is_closed, KooPaaError::GroupAlreadyClosed);
 
         // Find the recipient in the group
         let recipient_index = group
@@ -261,85 +269,143 @@ mod koopa {
             .position(|p| p.pubkey == recipient.key())
             .ok_or(KooPaaError::NotParticipant)?;
 
+        // Calculate current round based on time elapsed
+        let time_since_start = clock.unix_timestamp - group.start_timestamp.unwrap();
+        let payout_interval_secs = group.payout_interval as i64 * 86400; // Convert days to seconds
+        let current_round = (time_since_start / payout_interval_secs) as u8;
+
         // Check if this is the recipient's turn
+        let expected_recipient_index = (group.payout_round as usize) % group.participants.len();
         require!(
-            group.participants[recipient_index].claim_round == group.current_round,
+            recipient_index == expected_recipient_index,
             KooPaaError::NotCurrentRecipient
         );
 
-        // Check if they've already claimed
-        require!(
-            !group.participants[recipient_index].claimed,
-            KooPaaError::AlreadyClaimed
-        );
+        // Check if all participants have contributed for this round
+        let all_contributed = group
+            .participants
+            .iter()
+            .all(|p| p.contribution_round >= current_round);
 
-        // Check if all participants have contributed
-        let all_contributed = all_contributed(group);
         require!(all_contributed, KooPaaError::NotAllContributed);
 
         // Calculate the total amount to be claimed
-        let claim_amount = calculate_round_total(group);
+        let claim_amount = group.contribution_amount * (group.participants.len() as u64);
 
-        // Update the recipient's claim data
-        group.participants[recipient_index].claimed = true;
-        group.participants[recipient_index].claim_time = clock.unix_timestamp;
-        group.participants[recipient_index].claim_amount = claim_amount;
-
-        // Update group stats
-        group.total_distributed += claim_amount;
+        // Transfer the funds (handled in a separate payout instruction)
+        // This function just checks eligibility
 
         Ok(())
     }
 
-    // Move to the next round (can only be called by creator after interval has passed)
-    pub fn next_round(ctx: Context<NextRound>) -> Result<()> {
+    pub fn payout(ctx: Context<Payout>) -> Result<()> {
         let group = &mut ctx.accounts.ajo_group;
-        let global_state = &mut ctx.accounts.global_state;
         let clock = Clock::get()?;
 
-        // Check if it's the creator calling
+        let start_timestamp = group.start_timestamp.ok_or(KooPaaError::GroupNotStarted)?;
+        let time_since_start = clock.unix_timestamp - start_timestamp;
+
+        let payout_interval_secs = group.payout_interval as i64 * 86400; // Convert days to seconds
+        let expected_round = (time_since_start / payout_interval_secs) as u8;
+
         require!(
-            group.creator == ctx.accounts.creator.key(),
-            KooPaaError::OnlyCreatorCanStart
+            group.payout_round < expected_round,
+            KooPaaError::PayoutNotYetDue
         );
 
-        // Check if the group has started
-        require!(group.started, KooPaaError::GroupNotStarted);
+        let num_participants = group.participants.len() as u8;
+        let recipient_index = (group.payout_round as usize) % (num_participants as usize);
+        let recipient_pubkey = group.participants[recipient_index].pubkey;
 
-        // Check if the group has completed
-        require!(!group.completed, KooPaaError::GroupCompleted);
-
-        // Check if interval has passed
-        let current_time = clock.unix_timestamp;
-        let interval_seconds = days_to_seconds(group.interval_in_days);
+        // Verify the recipient is the correct one
         require!(
-            current_time >= group.last_round_timestamp + interval_seconds,
-            KooPaaError::IntervalNotPassed
+            recipient_pubkey == ctx.accounts.recipient.key(),
+            KooPaaError::NotCurrentRecipient
         );
 
-        // Update round information
-        group.current_round += 1;
-        group.last_round_timestamp = current_time;
+        let transfer_accounts = Transfer {
+            from: ctx.accounts.group_token_vault.to_account_info(),
+            to: ctx.accounts.recipient_token_account.to_account_info(),
+            authority: ctx.accounts.group_signer.to_account_info(),
+        };
 
-        // Check if all rounds are completed
-        if group.current_round >= group.num_participants {
-            group.completed = true;
-            global_state.active_groups -= 1;
-            global_state.completed_groups += 1;
-        }
+        // Each participant contributes the contribution_amount
+        let payout_amount = group.contribution_amount * (num_participants as u64);
+
+        // Get the correct seeds for the vault PDA
+        let group_name = group.name.clone();
+        let signer_seeds = &[
+            b"group-vault",
+            group_name.as_bytes(),
+            &[ctx.bumps.group_signer],
+        ];
+
+        transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                transfer_accounts,
+                &[signer_seeds],
+            ),
+            payout_amount,
+        )?;
+
+        group.payout_round += 1;
+
+        emit!(PayoutMadeEvent {
+            group_name: group.name.clone(),
+            recipient: recipient_pubkey,
+            payout_amount,
+            payout_round: group.payout_round,
+        });
 
         Ok(())
     }
 
-    // Update global state settings (admin only)
-    pub fn update_global_settings(
-        ctx: Context<UpdateGlobalSettings>,
-        fee_percentage: u8,
-    ) -> Result<()> {
-        require!(fee_percentage <= 100, KooPaaError::InvalidFeePercentage);
-
+    pub fn close_ajo_group(ctx: Context<CloseAjoGroup>) -> Result<()> {
+        let group = &mut ctx.accounts.ajo_group;
+        let participant = &ctx.accounts.participant;
         let global_state = &mut ctx.accounts.global_state;
-        global_state.fee_percentage = fee_percentage;
+
+        if group.is_closed {
+            return err!(KooPaaError::GroupAlreadyClosed);
+        }
+
+        // Check if the caller is a participant
+        let is_participant = group
+            .participants
+            .iter()
+            .any(|p| p.pubkey == participant.key());
+
+        require!(is_participant, KooPaaError::NotParticipant);
+
+        // Check if they've already voted
+        let already_voted = group.close_votes.contains(&participant.key());
+        if already_voted {
+            return err!(KooPaaError::AlreadyVotedToClose);
+        }
+
+        // Add their vote
+        group.close_votes.push(participant.key());
+
+        let total_participants = group.participants.len();
+        let total_votes = group.close_votes.len();
+
+        // If majority votes to close
+        if total_votes * 2 > total_participants {
+            // Refund security deposits if group has started
+            if group.start_timestamp.is_some() {
+                global_state.active_groups -= 1;
+            }
+
+            // Mark group as permanently inactive
+            group.is_closed = true;
+
+            emit!(AjoGroupClosedEvent {
+                group_name: group.name.clone(),
+                total_votes: total_votes as u8,
+                group_size: total_participants as u8,
+            });
+        }
 
         Ok(())
     }
@@ -363,7 +429,13 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(name: String)]
+#[instruction(
+    name: String,
+    contribution_amount: u64,
+    contribution_interval: u16,
+    payout_interval: u16,
+    num_participants: u8
+)]
 pub struct CreateAjoGroup<'info> {
     #[account(
         init,
@@ -386,7 +458,26 @@ pub struct CreateAjoGroup<'info> {
 
     pub token_mint: Account<'info, Mint>,
 
+    #[account(
+        mut,
+        constraint = creator_token_account.owner == creator.key(),
+        constraint = creator_token_account.mint == token_mint.key()
+    )]
+    pub creator_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = creator,
+        seeds = [b"group-vault", name.as_bytes()],
+        bump,
+        token::mint = token_mint,
+        token::authority = creator
+    )]
+    pub group_token_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -394,19 +485,33 @@ pub struct JoinAjoGroup<'info> {
     #[account(mut)]
     pub ajo_group: Account<'info, AjoGroup>,
 
+    #[account(mut)]
     pub participant: Signer<'info>,
 
-    pub system_program: Program<'info, System>,
-}
+    #[account(
+        mut,
+        seeds = [b"global-state"],
+        bump = global_state.bumps
+    )]
+    pub global_state: Account<'info, GlobalState>,
 
-#[derive(Accounts)]
-pub struct StartAjoGroup<'info> {
-    #[account(mut)]
-    pub ajo_group: Account<'info, AjoGroup>,
+    pub token_mint: Account<'info, Mint>,
 
-    #[account(constraint = ajo_group.creator == creator.key())]
-    pub creator: Signer<'info>,
+    #[account(
+        mut,
+        constraint = participant_token_account.owner == participant.key(),
+        constraint = participant_token_account.mint == token_mint.key()
+    )]
+    pub participant_token_account: Account<'info, TokenAccount>,
 
+    #[account(
+        mut,
+        seeds = [b"group-vault", ajo_group.key().as_ref()],
+        bump
+    )]
+    pub group_token_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
@@ -426,18 +531,10 @@ pub struct Contribute<'info> {
 
     #[account(
         mut,
-        constraint = recipient_token_account.mint == token_mint.key(),
-        constraint = recipient_token_account.owner == ajo_group.participants[ajo_group.current_receiver_index as usize].pubkey,
-
+        seeds = [b"group-vault", ajo_group.key().as_ref()],
+        bump
     )]
-    pub recipient_token_account: Account<'info, TokenAccount>,
-
-    #[account(
-        mut,
-        constraint = treasury_token_account.mint == token_mint.key(),
-        constraint = treasury_token_account.owner == global_state.admin,
-    )]
-    pub treasury_token_account: Account<'info, TokenAccount>,
+    pub group_token_vault: Account<'info, TokenAccount>,
 
     #[account(
         mut,
@@ -463,12 +560,44 @@ pub struct ClaimRound<'info> {
 }
 
 #[derive(Accounts)]
-pub struct NextRound<'info> {
+pub struct Payout<'info> {
     #[account(mut)]
     pub ajo_group: Account<'info, AjoGroup>,
 
-    #[account(constraint = ajo_group.creator == creator.key())]
-    pub creator: Signer<'info>,
+    #[account(
+        seeds = [b"group-vault", ajo_group.name.as_bytes()],
+        bump,
+    )]
+    /// CHECK: This is the PDA that signs for the vault
+    pub group_signer: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"group-vault", ajo_group.name.as_bytes()],
+        bump,
+    )]
+    pub group_token_vault: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub recipient: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = recipient_token_account.owner == recipient.key(),
+        constraint = recipient_token_account.mint == token_mint.key()
+    )]
+    pub recipient_token_account: Account<'info, TokenAccount>,
+
+    pub token_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct CloseAjoGroup<'info> {
+    #[account(mut)]
+    pub ajo_group: Account<'info, AjoGroup>,
+
+    pub participant: Signer<'info>,
 
     #[account(
         mut,
@@ -476,21 +605,6 @@ pub struct NextRound<'info> {
         bump = global_state.bumps
     )]
     pub global_state: Account<'info, GlobalState>,
-
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct UpdateGlobalSettings<'info> {
-    #[account(
-        mut,
-        seeds = [b"global-state"],
-        bump = global_state.bumps,
-        constraint = global_state.admin == admin.key() @ KooPaaError::OnlyAdminCanUpdate
-    )]
-    pub global_state: Account<'info, GlobalState>,
-
-    pub admin: Signer<'info>,
 
     pub system_program: Program<'info, System>,
 }
